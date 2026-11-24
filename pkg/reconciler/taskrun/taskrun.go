@@ -466,6 +466,9 @@ func (r *ReconcileTaskRun) handleUserTask(ctx context.Context, tr *tektonapi.Tas
 
 	res, err := r.handleHostAllocation(ctx, tr, secretName, targetPlatform)
 	if err != nil && !k8serrors.IsConflict(err) {
+		// Surface the underlying error (e.g. per-pool EC2 fleet errors) as a
+		// TaskRun event so failures are diagnosable without controller logs.
+		r.eventRecorder.Event(tr, "Error", "AllocationFailed", err.Error())
 		mpcmetrics.HandleMetrics(targetPlatform, func(metrics *mpcmetrics.PlatformMetrics) {
 			metrics.HostAllocationFailures.Inc()
 		})

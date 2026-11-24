@@ -16,6 +16,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"knative.dev/pkg/apis"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -243,6 +244,32 @@ var _ = Describe("Test Dynamic Host Provisioning", func() {
 			// 3rd reconcile: retries exceeded (failureCount == 2) → returns error
 			_, err = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: userNamespace, Name: "test-launch-fail"}})
 			Expect(err).Should(MatchError(ContainSubstring("launch failed")))
+		})
+
+		It("should emit an allocation failure event carrying the launch error", func(ctx SpecContext) {
+			recorder := record.NewFakeRecorder(20)
+			reconciler.eventRecorder = recorder
+			cloudImpl.FailLaunch = true
+			defer func() { cloudImpl.FailLaunch = false }()
+
+			createUserTaskRun(ctx, client, "test-alloc-fail-event", "linux/arm64")
+			for range 3 {
+				_, _ = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: userNamespace, Name: "test-alloc-fail-event"}})
+			}
+
+			events := []string{}
+		drain:
+			for {
+				select {
+				case event := <-recorder.Events:
+					events = append(events, event)
+				default:
+					break drain
+				}
+			}
+			Expect(events).Should(ContainElement(SatisfyAll(
+				ContainSubstring("AllocationFailed"),
+				ContainSubstring("launch failed"))))
 		})
 	})
 

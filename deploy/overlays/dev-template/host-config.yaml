@@ -27,7 +27,7 @@ data:
   dynamic.linux-amd64.type: aws
   dynamic.linux-amd64.region: us-east-1
   dynamic.linux-amd64.ami: ami-01aaf1c29c7e0f0af
-  dynamic.linux-amd64.instance-type: m5.xlarge
+  dynamic.linux-amd64.instance-types: "m5.xlarge,m5a.xlarge"
   dynamic.linux-amd64.key-name: AWS_SSH_KEY_NAME
   dynamic.linux-amd64.aws-secret: awsiam
   dynamic.linux-amd64.ssh-secret: awskeys

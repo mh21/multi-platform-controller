@@ -12,6 +12,7 @@ import (
 	"github.com/konflux-ci/multi-platform-controller/pkg/cloud"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	. "github.com/onsi/gomega/gstruct"
 )
 
 const systemNamespace = "multi-platform-controller"
@@ -175,6 +176,99 @@ var _ = Describe("Ec2 Unit Test Suit", func() {
 		})
 	})
 
+	Describe("CreateEc2CloudConfig instance-types", func() {
+		baseConfig := func(platformName string) map[string]string {
+			return map[string]string{
+				"dynamic." + platformName + ".region":        "test-region",
+				"dynamic." + platformName + ".ami":           "test-ami",
+				"dynamic." + platformName + ".instance-type": "c5.xlarge",
+				"dynamic." + platformName + ".key-name":      "test-key",
+				"dynamic." + platformName + ".subnet-id":     "subnet-1",
+			}
+		}
+
+		DescribeTable("parsing the instance-types key",
+			func(instanceTypesValue string, expectedTypes []string, expectedInstanceType string) {
+				platformName := "linux-amd64"
+				config := baseConfig(platformName)
+				config["dynamic."+platformName+".instance-types"] = instanceTypesValue
+				provider := CreateEc2CloudConfig(platformName, config, systemNamespace).(AWSEc2DynamicConfig)
+
+				Expect(provider.InstanceTypes).Should(Equal(expectedTypes))
+				Expect(provider.InstanceType).Should(Equal(expectedInstanceType))
+				Expect(provider.instanceTypesErr).ShouldNot(HaveOccurred())
+				Expect(provider.platformName).Should(Equal(platformName))
+			},
+			Entry("empty value keeps the single instance-type value", "", nil, "c5.xlarge"),
+			Entry("single entry", "t3.micro", []string{"t3.micro"}, "t3.micro"),
+			Entry("multiple entries", "inf1.24xlarge,t3.micro,c5.xlarge", []string{"inf1.24xlarge", "t3.micro", "c5.xlarge"}, "inf1.24xlarge"),
+			Entry("entries are trimmed", " inf1.24xlarge , t3.micro ", []string{"inf1.24xlarge", "t3.micro"}, "inf1.24xlarge"),
+			Entry("trailing comma is tolerated", "inf1.24xlarge,t3.micro,", []string{"inf1.24xlarge", "t3.micro"}, "inf1.24xlarge"),
+			Entry("arm64 families of several generations", "t4g.medium,m6g.large,x8g.48xlarge", []string{"t4g.medium", "m6g.large", "x8g.48xlarge"}, "t4g.medium"),
+		)
+
+		When("the instance-types key is absent", func() {
+			It("should keep the single instance-type value", func() {
+				platformName := "linux-amd64"
+				provider := CreateEc2CloudConfig(platformName, baseConfig(platformName), systemNamespace).(AWSEc2DynamicConfig)
+
+				Expect(provider.InstanceTypes).Should(BeNil())
+				Expect(provider.InstanceType).Should(Equal("c5.xlarge"))
+				Expect(provider.instanceTypesErr).ShouldNot(HaveOccurred())
+				Expect(provider.platformName).Should(Equal(platformName))
+			})
+		})
+
+		DescribeTable("rejecting malformed instance-types values",
+			func(instanceTypesValue string) {
+				platformName := "linux-amd64"
+				config := baseConfig(platformName)
+				config["dynamic."+platformName+".instance-types"] = instanceTypesValue
+				provider := CreateEc2CloudConfig(platformName, config, systemNamespace).(AWSEc2DynamicConfig)
+
+				Expect(provider.InstanceTypes).Should(BeNil())
+				Expect(provider.instanceTypesErr).Should(HaveOccurred())
+			},
+			Entry("empty entry in the middle", "inf1.24xlarge,,t3.micro"),
+			Entry("leading comma", ",inf1.24xlarge"),
+			Entry("comma only", ","),
+			Entry("architecture mix", "t3.micro,t4g.micro"),
+			Entry("architecture mix across families", "c5.xlarge,m6g.large,t3.micro"),
+		)
+
+		When("the instance-types value is malformed", func() {
+			It("should fail the launch with the parse error", func(ctx SpecContext) {
+				platformName := "linux-amd64"
+				config := map[string]string{
+					"dynamic." + platformName + ".instance-types": "inf1.24xlarge,,t3.micro",
+				}
+				provider := CreateEc2CloudConfig(platformName, config, systemNamespace).(AWSEc2DynamicConfig)
+				provider.ec2Client = &mockEC2Client{}
+
+				_, err := provider.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+
+				Expect(err).Should(MatchError(ContainSubstring("invalid instance-types configuration")))
+				Expect(err).Should(MatchError(ContainSubstring("empty instance type")))
+			})
+		})
+
+		When("the instance-types value mixes CPU architectures", func() {
+			It("should fail the launch with an architecture error", func(ctx SpecContext) {
+				platformName := "linux-amd64"
+				config := map[string]string{
+					"dynamic." + platformName + ".instance-types": "t3.micro,t4g.micro",
+				}
+				provider := CreateEc2CloudConfig(platformName, config, systemNamespace).(AWSEc2DynamicConfig)
+				provider.ec2Client = &mockEC2Client{}
+
+				_, err := provider.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+
+				Expect(err).Should(MatchError(ContainSubstring("invalid instance-types configuration")))
+				Expect(err).Should(MatchError(ContainSubstring("mixing architectures is not supported")))
+			})
+		})
+	})
+
 	Describe("CloudProvider methods", func() {
 		var (
 			mock *mockEC2Client
@@ -233,12 +327,231 @@ var _ = Describe("Ec2 Unit Test Suit", func() {
 					Expect(err).Should(MatchError(ContainSubstring("invalid TaskRun ID")))
 				})
 			})
+
+			When("the platform lists multiple instance types", func() {
+				var fleetCfg AWSEc2DynamicConfig
+
+				BeforeEach(func() {
+					resetLaunchTemplateCache()
+					fleetCfg = AWSEc2DynamicConfig{
+						InstanceTypes: []string{"inf1.24xlarge", "t3.micro"},
+						InstanceType:  "inf1.24xlarge",
+						KeyName:       "test-key",
+						Ami:           "ami-123",
+						Disk:          40,
+						SubnetId:      "subnet-1",
+						platformName:  "linux-amd64",
+						ec2Client:     mock,
+					}
+					mock.DescribeLaunchTemplatesOutput = &ec2.DescribeLaunchTemplatesOutput{}
+					mock.CreateFleetOutput = &ec2.CreateFleetOutput{
+						Instances: []types.CreateFleetInstance{{
+							InstanceIds:  []string{"i-fleet"},
+							InstanceType: "t3.micro",
+						}},
+					}
+				})
+
+				It("should launch through CreateFleet and return the instance ID", func(ctx SpecContext) {
+					id, err := fleetCfg.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+
+					Expect(err).ShouldNot(HaveOccurred())
+					Expect(string(id)).Should(Equal("i-fleet"))
+					Expect(mock.RunInstancesInput).Should(BeNil())
+					Expect(mock.CreateFleetInput).ShouldNot(BeNil())
+					Expect(mock.CreateLaunchTemplateInput).ShouldNot(BeNil())
+				})
+
+				It("should build an instant one-instance on-demand fleet with one prioritized override per type", func(ctx SpecContext) {
+					_, err := fleetCfg.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+					Expect(err).ShouldNot(HaveOccurred())
+
+					input := mock.CreateFleetInput
+					Expect(input.Type).Should(Equal(types.FleetTypeInstant))
+					Expect(input.TargetCapacitySpecification).ShouldNot(BeNil())
+					Expect(*input.TargetCapacitySpecification.TotalTargetCapacity).Should(Equal(int32(1)))
+					Expect(input.TargetCapacitySpecification.DefaultTargetCapacityType).Should(Equal(types.DefaultTargetCapacityTypeOnDemand))
+					Expect(input.OnDemandOptions).ShouldNot(BeNil())
+					Expect(input.OnDemandOptions.AllocationStrategy).Should(Equal(types.FleetOnDemandAllocationStrategyPrioritized))
+
+					Expect(input.LaunchTemplateConfigs).Should(HaveLen(1))
+					templateConfig := input.LaunchTemplateConfigs[0]
+					Expect(templateConfig.LaunchTemplateSpecification).ShouldNot(BeNil())
+					Expect(*templateConfig.LaunchTemplateSpecification.LaunchTemplateName).Should(Equal("mpc-linux-amd64"))
+					Expect(*templateConfig.LaunchTemplateSpecification.Version).Should(Equal("$Default"))
+
+					overrides := templateConfig.Overrides
+					Expect(overrides).Should(HaveLen(2))
+					Expect(string(overrides[0].InstanceType)).Should(Equal("inf1.24xlarge"))
+					Expect(*overrides[0].SubnetId).Should(Equal("subnet-1"))
+					Expect(*overrides[0].Priority).Should(Equal(0.0))
+					Expect(string(overrides[1].InstanceType)).Should(Equal("t3.micro"))
+					Expect(*overrides[1].SubnetId).Should(Equal("subnet-1"))
+					Expect(*overrides[1].Priority).Should(Equal(1.0))
+				})
+
+				It("should tag both the instance and its volumes like RunInstances does", func(ctx SpecContext) {
+					_, err := fleetCfg.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+					Expect(err).ShouldNot(HaveOccurred())
+
+					Expect(mock.CreateFleetInput.TagSpecifications).Should(HaveLen(2))
+					Expect(mock.CreateFleetInput.TagSpecifications[0].ResourceType).Should(Equal(types.ResourceTypeInstance))
+					Expect(mock.CreateFleetInput.TagSpecifications[1].ResourceType).Should(Equal(types.ResourceTypeVolume))
+					for _, tagSpecification := range mock.CreateFleetInput.TagSpecifications {
+						tags := tagSpecification.Tags
+						Expect(tags).Should(ContainElement(SatisfyAll(
+							HaveField("Key", PointTo(Equal(MultiPlatformManaged))),
+							HaveField("Value", PointTo(Equal("true"))))))
+						Expect(tags).Should(ContainElement(SatisfyAll(
+							HaveField("Key", PointTo(Equal(cloud.InstanceTag))),
+							HaveField("Value", PointTo(Equal("tag"))))))
+						Expect(tags).Should(ContainElement(SatisfyAll(
+							HaveField("Key", PointTo(Equal("Name"))),
+							HaveField("Value", PointTo(Equal("multi-platform-builder-task"))))))
+						Expect(tags).Should(ContainElement(SatisfyAll(
+							HaveField("Key", PointTo(Equal(cloud.TaskRunTagKey))),
+							HaveField("Value", PointTo(Equal("ns:task"))))))
+					}
+				})
+
+				When("the fleet reports per-pool errors alongside the launched instance", func() {
+					It("should still return the instance ID", func(ctx SpecContext) {
+						mock.CreateFleetOutput = &ec2.CreateFleetOutput{
+							Instances: []types.CreateFleetInstance{{InstanceIds: []string{"i-fleet"}, InstanceType: "t3.micro"}},
+							Errors: []types.CreateFleetError{{
+								ErrorCode:    aws.String("InstanceLimitExceeded"),
+								ErrorMessage: aws.String("inf1.24xlarge exceeds the vCPU quota"),
+							}},
+						}
+
+						id, err := fleetCfg.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+
+						Expect(err).ShouldNot(HaveOccurred())
+						Expect(string(id)).Should(Equal("i-fleet"))
+					})
+				})
+
+				When("the fleet cannot launch any instance", func() {
+					It("should return an error listing every per-pool error", func(ctx SpecContext) {
+						mock.CreateFleetOutput = &ec2.CreateFleetOutput{
+							Errors: []types.CreateFleetError{
+								{ErrorCode: aws.String("InstanceLimitExceeded"), ErrorMessage: aws.String("inf1.24xlarge exceeds the vCPU quota")},
+								{ErrorCode: aws.String("InsufficientInstanceCapacity"), ErrorMessage: aws.String("t3.micro has no capacity")},
+							},
+						}
+
+						_, err := fleetCfg.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+
+						Expect(err).Should(MatchError(ContainSubstring("no instances were created")))
+						Expect(err).Should(MatchError(ContainSubstring("InstanceLimitExceeded: inf1.24xlarge exceeds the vCPU quota")))
+						Expect(err).Should(MatchError(ContainSubstring("InsufficientInstanceCapacity: t3.micro has no capacity")))
+					})
+
+					It("should report when the fleet returns no error details", func(ctx SpecContext) {
+						mock.CreateFleetOutput = &ec2.CreateFleetOutput{}
+
+						_, err := fleetCfg.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+
+						Expect(err).Should(MatchError(ContainSubstring("no error details were returned")))
+					})
+				})
+
+				When("the CreateFleet API call fails", func() {
+					It("should return the error", func(ctx SpecContext) {
+						mock.CreateFleetErr = errors.New("api failure")
+
+						_, err := fleetCfg.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+
+						Expect(err).Should(MatchError(ContainSubstring("failed to launch EC2 fleet")))
+						Expect(err).Should(MatchError(ContainSubstring("api failure")))
+					})
+				})
+
+				When("the launch template cannot be ensured", func() {
+					It("should return the ensure error", func(ctx SpecContext) {
+						mock.DescribeLaunchTemplatesErr = errors.New("AccessDenied")
+
+						_, err := fleetCfg.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+
+						Expect(err).Should(MatchError(ContainSubstring("failed to ensure launch template")))
+						Expect(err).Should(MatchError(ContainSubstring("AccessDenied")))
+					})
+				})
+
+				When("the platform is configured for MacOS dedicated hosts", func() {
+					It("should reject the fleet launch", func(ctx SpecContext) {
+						fleetCfg.Tenancy = "host"
+						fleetCfg.HostResourceGroupArn = "arn:aws:resource-groups:us-east-1:123456789012:group/mac-hosts"
+						fleetCfg.LicenseConfigurationArn = "arn:aws:license-manager:us-east-1:123456789012:license-configuration:lic-macos"
+
+						_, err := fleetCfg.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+
+						Expect(err).Should(MatchError(ContainSubstring("MacOS dedicated host")))
+						Expect(mock.CreateFleetInput).Should(BeNil())
+					})
+				})
+
+				When("no subnet is configured", func() {
+					It("should reject the fleet launch", func(ctx SpecContext) {
+						fleetCfg.SubnetId = ""
+
+						_, err := fleetCfg.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+
+						Expect(err).Should(MatchError(ContainSubstring("subnet-id")))
+						Expect(mock.CreateFleetInput).Should(BeNil())
+					})
+				})
+			})
+
+			When("the platform lists a single instance type", func() {
+				It("should launch through RunInstances with that type", func(ctx SpecContext) {
+					platformName := "linux-amd64"
+					config := map[string]string{
+						"dynamic." + platformName + ".instance-types": "m5.large",
+						"dynamic." + platformName + ".instance-type":  "c5.xlarge",
+						"dynamic." + platformName + ".key-name":       "test-key",
+					}
+					provider := CreateEc2CloudConfig(platformName, config, systemNamespace).(AWSEc2DynamicConfig)
+					provider.ec2Client = mock
+					mock.RunInstancesOutput = &ec2.RunInstancesOutput{
+						Instances: []types.Instance{{InstanceId: aws.String("i-single")}},
+					}
+
+					id, err := provider.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+
+					Expect(err).ShouldNot(HaveOccurred())
+					Expect(string(id)).Should(Equal("i-single"))
+					Expect(mock.RunInstancesInput).ShouldNot(BeNil())
+					Expect(mock.RunInstancesInput.InstanceType).Should(Equal(types.InstanceType("m5.large")))
+					Expect(mock.CreateFleetInput).Should(BeNil())
+				})
+			})
+
+			When("the platform has no instance-types configured", func() {
+				It("should launch through RunInstances without calling CreateFleet", func(ctx SpecContext) {
+					mock.RunInstancesOutput = &ec2.RunInstancesOutput{
+						Instances: []types.Instance{{InstanceId: aws.String("i-legacy")}},
+					}
+
+					id, err := cfg.LaunchInstance(nil, ctx, "ns:task", "tag", map[string]string{})
+
+					Expect(err).ShouldNot(HaveOccurred())
+					Expect(string(id)).Should(Equal("i-legacy"))
+					Expect(mock.RunInstancesInput).ShouldNot(BeNil())
+					Expect(mock.RunInstancesInput.InstanceType).Should(Equal(types.InstanceType("t4g.medium")))
+					Expect(mock.RunInstancesInput.MinCount).Should(PointTo(Equal(int32(1))))
+					Expect(mock.RunInstancesInput.MaxCount).Should(PointTo(Equal(int32(1))))
+					Expect(mock.CreateFleetInput).Should(BeNil())
+				})
+			})
 		})
 
 		Describe("CountInstances", func() {
 			// Each entry provides the full set of instances and the instanceTag,
-			// verifying both the tag filters sent to DescribeInstances and the
-			// client-side filtering by state and instance type.
+			// verifying the tag filters sent to DescribeInstances and the
+			// state-based filtering. Managed instances are scoped by tags; a
+			// platform may launch several instance types, so any instance type
+			// counts as long as the tags match.
 			DescribeTable("tag filters and instance filtering",
 				func(ctx SpecContext, instanceTag string, instances []types.Instance, expectedCount int) {
 					mock.DescribeInstancesOutput = &ec2.DescribeInstancesOutput{
@@ -256,32 +569,39 @@ var _ = Describe("Ec2 Unit Test Suit", func() {
 					Expect(*mock.DescribeInstancesInput.Filters[1].Name).Should(Equal("tag:MultiPlatformManaged"))
 					Expect(mock.DescribeInstancesInput.Filters[1].Values).Should(ConsistOf("true"))
 				},
-				Entry("running + correct type = counted",
+				Entry("running + configured type = counted",
 					"my-tag",
 					[]types.Instance{
 						{InstanceId: aws.String("i-1"), State: &types.InstanceState{Name: types.InstanceStateNameRunning}, InstanceType: "t4g.medium"},
 					}, 1,
 				),
-				Entry("running + correct type alongside terminated + correct type = only running counted",
+				Entry("running + configured type alongside terminated + configured type = only running counted",
 					"prod-tag",
 					[]types.Instance{
 						{InstanceId: aws.String("i-1"), State: &types.InstanceState{Name: types.InstanceStateNameRunning}, InstanceType: "t4g.medium"},
 						{InstanceId: aws.String("i-2"), State: &types.InstanceState{Name: types.InstanceStateNameTerminated}, InstanceType: "t4g.medium"},
 					}, 1,
 				),
-				Entry("running + wrong type = not counted",
+				Entry("running + other instance type = counted (tags scope managed instances)",
 					"my-tag",
 					[]types.Instance{
 						{InstanceId: aws.String("i-1"), State: &types.InstanceState{Name: types.InstanceStateNameRunning}, InstanceType: "m5.large"},
-					}, 0,
+					}, 1,
 				),
-				Entry("pending + correct type = counted (non-terminated states count)",
+				Entry("running instances of several types = all counted (fleet fallback types)",
+					"my-tag",
+					[]types.Instance{
+						{InstanceId: aws.String("i-1"), State: &types.InstanceState{Name: types.InstanceStateNameRunning}, InstanceType: "t4g.medium"},
+						{InstanceId: aws.String("i-2"), State: &types.InstanceState{Name: types.InstanceStateNameRunning}, InstanceType: "m5.large"},
+					}, 2,
+				),
+				Entry("pending + configured type = counted (non-terminated states count)",
 					"my-tag",
 					[]types.Instance{
 						{InstanceId: aws.String("i-1"), State: &types.InstanceState{Name: types.InstanceStateNamePending}, InstanceType: "t4g.medium"},
 					}, 1,
 				),
-				Entry("stopped + correct type = counted",
+				Entry("stopped + configured type = counted",
 					"my-tag",
 					[]types.Instance{
 						{InstanceId: aws.String("i-1"), State: &types.InstanceState{Name: types.InstanceStateNameStopped}, InstanceType: "t4g.medium"},
@@ -421,8 +741,8 @@ var _ = Describe("Ec2 Unit Test Suit", func() {
 				})
 			})
 
-			When("instances match state and type filters", func() {
-				It("should return only matching reachable instances", func(ctx SpecContext) {
+			When("instances match the tag and state filters", func() {
+				It("should return only non-terminated reachable instances of any type", func(ctx SpecContext) {
 					cfg.pingFunc = func(_ string) error { return nil }
 					now := time.Now()
 					mock.DescribeInstancesOutput = &ec2.DescribeInstancesOutput{
@@ -430,7 +750,7 @@ var _ = Describe("Ec2 Unit Test Suit", func() {
 							Instances: []types.Instance{
 								{InstanceId: aws.String("i-match"), State: &types.InstanceState{Name: types.InstanceStateNameRunning}, InstanceType: "t4g.medium", PublicIpAddress: aws.String("10.0.0.1"), LaunchTime: &now},
 								{InstanceId: aws.String("i-terminated"), State: &types.InstanceState{Name: types.InstanceStateNameTerminated}, InstanceType: "t4g.medium", PublicIpAddress: aws.String("10.0.0.2"), LaunchTime: &now},
-								{InstanceId: aws.String("i-wrong-type"), State: &types.InstanceState{Name: types.InstanceStateNameRunning}, InstanceType: "m5.large", PublicIpAddress: aws.String("10.0.0.3"), LaunchTime: &now},
+								{InstanceId: aws.String("i-fallback-type"), State: &types.InstanceState{Name: types.InstanceStateNameRunning}, InstanceType: "m5.large", PublicIpAddress: aws.String("10.0.0.3"), LaunchTime: &now},
 							},
 						}},
 					}
@@ -438,9 +758,10 @@ var _ = Describe("Ec2 Unit Test Suit", func() {
 					instances, err := cfg.ListInstances(nil, ctx, "tag")
 
 					Expect(err).ShouldNot(HaveOccurred())
-					Expect(instances).Should(HaveLen(1))
-					Expect(string(instances[0].InstanceId)).Should(Equal("i-match"))
-					Expect(instances[0].Address).Should(Equal("10.0.0.1"))
+					Expect(instances).Should(HaveLen(2))
+					instanceIDs := []string{string(instances[0].InstanceId), string(instances[1].InstanceId)}
+					Expect(instanceIDs).Should(ConsistOf("i-match", "i-fallback-type"))
+					Expect(instances[0].Address).ShouldNot(BeEmpty())
 					Expect(instances[0].StartTime).Should(BeTemporally("~", now, time.Second))
 				})
 			})

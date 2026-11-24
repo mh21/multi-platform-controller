@@ -2,6 +2,7 @@ package aws
 
 import (
 	"encoding/base64"
+	"errors"
 
 	"github.com/konflux-ci/multi-platform-controller/pkg/cloud"
 	. "github.com/onsi/ginkgo/v2"
@@ -310,6 +311,379 @@ var _ = Describe("AWS EC2 Helper Functions", func() {
 		})
 	})
 
+	Describe("parseInstanceTypes", func() {
+		DescribeTable("parsing the raw value",
+			func(raw string, expected []string) {
+				instanceTypes, err := parseInstanceTypes(raw)
+
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(instanceTypes).Should(Equal(expected))
+			},
+			Entry("empty value", "", nil),
+			Entry("single entry", "c5.xlarge", []string{"c5.xlarge"}),
+			Entry("multiple entries", "c5.xlarge,c6i.xlarge,m6a.xlarge", []string{"c5.xlarge", "c6i.xlarge", "m6a.xlarge"}),
+			Entry("entries are trimmed", " c5.xlarge , c6i.xlarge ", []string{"c5.xlarge", "c6i.xlarge"}),
+			Entry("trailing comma is tolerated", "c5.xlarge,", []string{"c5.xlarge"}),
+			Entry("arm64 types of several generations mix fine", "t4g.medium,m6gd.large,x8g.48xlarge", []string{"t4g.medium", "m6gd.large", "x8g.48xlarge"}),
+			Entry("unrecognized families default to x86_64", "c9v.xlarge,c5.xlarge", []string{"c9v.xlarge", "c5.xlarge"}),
+		)
+
+		DescribeTable("rejecting malformed values",
+			func(raw string, expectedMessage string) {
+				_, err := parseInstanceTypes(raw)
+
+				Expect(err).Should(MatchError(ContainSubstring(expectedMessage)))
+			},
+			Entry("empty entry in the middle", "c5.xlarge,,c6i.xlarge", "empty instance type"),
+			Entry("leading comma", ",c5.xlarge", "empty instance type"),
+			Entry("comma only", ",", "empty instance type"),
+			Entry("space entry in the middle", "c5.xlarge, ,c6i.xlarge", "empty instance type"),
+			Entry("architecture mix", "c5.xlarge,t4g.micro", "mixing architectures"),
+			Entry("architecture mix with arm64 first", "t4g.micro,c5.xlarge", "mixing architectures"),
+		)
+	})
+
+	Describe("instanceTypeArchitecture", func() {
+		DescribeTable("architecture by family",
+			func(instanceType string, expected string) {
+				Expect(instanceTypeArchitecture(instanceType)).Should(Equal(expected))
+			},
+			Entry("x86_64 compute family", "c5.xlarge", "x86_64"),
+			Entry("x86_64 general family", "m5.large", "x86_64"),
+			Entry("x86_64 memory family", "r7i.8xlarge", "x86_64"),
+			Entry("x86_64 burstable family", "t3.micro", "x86_64"),
+			Entry("x86_64 inferentia-adjacent naming", "inf1.24xlarge", "x86_64"),
+			Entry("arm64 burstable family", "t4g.medium", "arm64"),
+			Entry("arm64 graviton compute family", "c6g.large", "arm64"),
+			Entry("arm64 graviton compute with nvme variant", "c6gd.xlarge", "arm64"),
+			Entry("arm64 graviton compute with network variant", "c6gn.xlarge", "arm64"),
+			Entry("arm64 graviton general family", "m6g.large", "arm64"),
+			Entry("arm64 graviton memory family", "r8g.48xlarge", "arm64"),
+			Entry("arm64 first generation", "a1.large", "arm64"),
+			Entry("arm64 gpu family", "g5g.xlarge", "arm64"),
+			Entry("arm64 high-memory family", "x2gd.2xlarge", "arm64"),
+			Entry("arm64 newest high-memory family", "x8g.48xlarge", "arm64"),
+			Entry("arm64 intell family with suffix", "is4gen.2xlarge", "arm64"),
+			Entry("arm64 intell family with nvme suffix", "im4gn.16xlarge", "arm64"),
+		)
+	})
+
+	Describe("configureFleet", func() {
+		var ecConfig AWSEc2DynamicConfig
+
+		BeforeEach(func() {
+			ecConfig = newDefaultValidEC2ConfigForInstance()
+			ecConfig.InstanceTypes = []string{"c5.xlarge", "c6i.xlarge", "m6a.xlarge"}
+		})
+
+		It("should build an instant one-instance on-demand fleet", func() {
+			input := ecConfig.configureFleet("mpc-linux-amd64", "my-task", "my-tag", map[string]string{})
+
+			Expect(input.Type).Should(Equal(types.FleetTypeInstant))
+			Expect(input.TargetCapacitySpecification).ShouldNot(BeNil())
+			Expect(*input.TargetCapacitySpecification.TotalTargetCapacity).Should(Equal(int32(1)))
+			Expect(input.TargetCapacitySpecification.DefaultTargetCapacityType).Should(Equal(types.DefaultTargetCapacityTypeOnDemand))
+			Expect(input.OnDemandOptions).ShouldNot(BeNil())
+			Expect(input.OnDemandOptions.AllocationStrategy).Should(Equal(types.FleetOnDemandAllocationStrategyPrioritized))
+			Expect(input.SpotOptions).Should(BeNil())
+		})
+
+		It("should reference the launch template as $Default with one override per type in the configured subnet", func() {
+			input := ecConfig.configureFleet("mpc-linux-amd64", "my-task", "my-tag", map[string]string{})
+
+			Expect(input.LaunchTemplateConfigs).Should(HaveLen(1))
+			templateConfig := input.LaunchTemplateConfigs[0]
+			Expect(*templateConfig.LaunchTemplateSpecification.LaunchTemplateName).Should(Equal("mpc-linux-amd64"))
+			Expect(*templateConfig.LaunchTemplateSpecification.Version).Should(Equal("$Default"))
+			Expect(templateConfig.Overrides).Should(HaveLen(3))
+			for i, override := range templateConfig.Overrides {
+				Expect(override.SubnetId).Should(PointTo(Equal(ecConfig.SubnetId)))
+				Expect(override.Priority).Should(PointTo(Equal(float64(i))))
+			}
+			Expect(string(templateConfig.Overrides[0].InstanceType)).Should(Equal("c5.xlarge"))
+			Expect(string(templateConfig.Overrides[1].InstanceType)).Should(Equal("c6i.xlarge"))
+			Expect(string(templateConfig.Overrides[2].InstanceType)).Should(Equal("m6a.xlarge"))
+		})
+
+		It("should tag the instance and the volume with the managed-instance tags", func() {
+			input := ecConfig.configureFleet("mpc-linux-amd64", "my-task", "my-tag", map[string]string{"CostCenter": "AlphaTeam"})
+
+			Expect(input.TagSpecifications).Should(HaveLen(2))
+			Expect(input.TagSpecifications[0].ResourceType).Should(Equal(types.ResourceTypeInstance))
+			Expect(input.TagSpecifications[1].ResourceType).Should(Equal(types.ResourceTypeVolume))
+			tags := input.TagSpecifications[0].Tags
+			Expect(tags).Should(HaveLen(4))
+			Expect(tags).Should(ContainElement(SatisfyAll(
+				HaveField("Key", PointTo(Equal(MultiPlatformManaged))),
+				HaveField("Value", PointTo(Equal("true"))))))
+			Expect(tags).Should(ContainElement(SatisfyAll(
+				HaveField("Key", PointTo(Equal(cloud.InstanceTag))),
+				HaveField("Value", PointTo(Equal("my-tag"))))))
+			Expect(tags).Should(ContainElement(SatisfyAll(
+				HaveField("Key", PointTo(Equal("Name"))),
+				HaveField("Value", PointTo(Equal("multi-platform-builder-my-task"))))))
+			Expect(tags).Should(ContainElement(SatisfyAll(
+				HaveField("Key", PointTo(Equal("CostCenter"))),
+				HaveField("Value", PointTo(Equal("AlphaTeam"))))))
+		})
+	})
+
+	Describe("ensureLaunchTemplate", func() {
+		var (
+			mock     *mockEC2Client
+			ecConfig AWSEc2DynamicConfig
+		)
+
+		BeforeEach(func() {
+			resetLaunchTemplateCache()
+			mock = &mockEC2Client{}
+			ecConfig = newDefaultValidEC2ConfigForInstance()
+			ecConfig.platformName = "linux-amd64"
+		})
+
+		When("the launch template does not exist", func() {
+			It("should create it with the platform configuration", func(ctx SpecContext) {
+				mock.DescribeLaunchTemplatesOutput = &ec2.DescribeLaunchTemplatesOutput{}
+
+				name, err := ecConfig.ensureLaunchTemplate(mock, ctx)
+
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(name).Should(Equal("mpc-linux-amd64"))
+				Expect(mock.CreateLaunchTemplateInput).ShouldNot(BeNil())
+				Expect(*mock.CreateLaunchTemplateInput.LaunchTemplateName).Should(Equal("mpc-linux-amd64"))
+
+				data := mock.CreateLaunchTemplateInput.LaunchTemplateData
+				Expect(data).ShouldNot(BeNil())
+				Expect(*data.ImageId).Should(Equal(ecConfig.Ami))
+				Expect(*data.KeyName).Should(Equal(ecConfig.KeyName))
+				Expect(data.SecurityGroupIds).Should(ConsistOf(ecConfig.SecurityGroupId))
+				Expect(data.SecurityGroups).Should(BeNil())
+				Expect(data.EbsOptimized).Should(PointTo(BeTrue()))
+				Expect(data.UserData).Should(Equal(ecConfig.UserData))
+				Expect(data.IamInstanceProfile).ShouldNot(BeNil())
+				Expect(*data.IamInstanceProfile.Arn).Should(Equal(ecConfig.InstanceProfileArn))
+				Expect(data.InstanceInitiatedShutdownBehavior).Should(Equal(types.ShutdownBehaviorTerminate))
+
+				Expect(data.BlockDeviceMappings).Should(HaveLen(1))
+				mapping := data.BlockDeviceMappings[0]
+				Expect(*mapping.DeviceName).Should(Equal("/dev/sda1"))
+				Expect(mapping.Ebs).ShouldNot(BeNil())
+				Expect(mapping.Ebs.DeleteOnTermination).Should(PointTo(BeTrue()))
+				Expect(mapping.Ebs.VolumeSize).Should(PointTo(Equal(ecConfig.Disk)))
+				Expect(mapping.Ebs.VolumeType).Should(Equal(types.VolumeTypeGp3))
+				Expect(mapping.Ebs.Iops).Should(Equal(ecConfig.Iops))
+				Expect(mapping.Ebs.Throughput).Should(Equal(ecConfig.Throughput))
+
+				Expect(mock.CreateLaunchTemplateVersionInput).Should(BeNil())
+				Expect(mock.ModifyLaunchTemplateInput).Should(BeNil())
+			})
+
+			It("should treat a NotFound describe error as missing", func(ctx SpecContext) {
+				mock.DescribeLaunchTemplatesErr = errors.New("InvalidLaunchTemplateName.NotFoundException: The specified launch template was not found")
+
+				name, err := ecConfig.ensureLaunchTemplate(mock, ctx)
+
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(name).Should(Equal("mpc-linux-amd64"))
+				Expect(mock.CreateLaunchTemplateInput).ShouldNot(BeNil())
+			})
+		})
+
+		When("the launch template exists and is already cached for this configuration", func() {
+			It("should not create a new version", func(ctx SpecContext) {
+				mock.DescribeLaunchTemplatesOutput = &ec2.DescribeLaunchTemplatesOutput{
+					LaunchTemplates: []types.LaunchTemplate{{LaunchTemplateName: aws.String("mpc-linux-amd64")}},
+				}
+				mock.CreateLaunchTemplateVersionOutput = &ec2.CreateLaunchTemplateVersionOutput{
+					LaunchTemplateVersion: &types.LaunchTemplateVersion{VersionNumber: aws.Int64(3)},
+				}
+
+				_, err := ecConfig.ensureLaunchTemplate(mock, ctx)
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(mock.CreateLaunchTemplateVersionInput).ShouldNot(BeNil())
+				mock.CreateLaunchTemplateVersionInput = nil
+				mock.ModifyLaunchTemplateInput = nil
+
+				_, err = ecConfig.ensureLaunchTemplate(mock, ctx)
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(mock.CreateLaunchTemplateVersionInput).Should(BeNil())
+				Expect(mock.CreateLaunchTemplateInput).Should(BeNil())
+				Expect(mock.ModifyLaunchTemplateInput).Should(BeNil())
+			})
+		})
+
+		When("the launch template exists with a different configuration", func() {
+			It("should create a version and set it as the default", func(ctx SpecContext) {
+				mock.DescribeLaunchTemplatesOutput = &ec2.DescribeLaunchTemplatesOutput{
+					LaunchTemplates: []types.LaunchTemplate{{LaunchTemplateName: aws.String("mpc-linux-amd64")}},
+				}
+				mock.CreateLaunchTemplateVersionOutput = &ec2.CreateLaunchTemplateVersionOutput{
+					LaunchTemplateVersion: &types.LaunchTemplateVersion{VersionNumber: aws.Int64(7)},
+				}
+
+				_, err := ecConfig.ensureLaunchTemplate(mock, ctx)
+
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(mock.CreateLaunchTemplateInput).Should(BeNil())
+				Expect(mock.CreateLaunchTemplateVersionInput).ShouldNot(BeNil())
+				Expect(*mock.CreateLaunchTemplateVersionInput.LaunchTemplateName).Should(Equal("mpc-linux-amd64"))
+				Expect(mock.CreateLaunchTemplateVersionInput.LaunchTemplateData).ShouldNot(BeNil())
+				Expect(mock.ModifyLaunchTemplateInput).ShouldNot(BeNil())
+				Expect(*mock.ModifyLaunchTemplateInput.LaunchTemplateName).Should(Equal("mpc-linux-amd64"))
+				Expect(*mock.ModifyLaunchTemplateInput.DefaultVersion).Should(Equal("7"))
+			})
+
+			It("should create a new version when the configuration hash changes", func(ctx SpecContext) {
+				mock.DescribeLaunchTemplatesOutput = &ec2.DescribeLaunchTemplatesOutput{
+					LaunchTemplates: []types.LaunchTemplate{{LaunchTemplateName: aws.String("mpc-linux-amd64")}},
+				}
+				mock.CreateLaunchTemplateVersionOutput = &ec2.CreateLaunchTemplateVersionOutput{
+					LaunchTemplateVersion: &types.LaunchTemplateVersion{VersionNumber: aws.Int64(4)},
+				}
+
+				_, err := ecConfig.ensureLaunchTemplate(mock, ctx)
+				Expect(err).ShouldNot(HaveOccurred())
+				mock.CreateLaunchTemplateVersionInput = nil
+
+				ecConfig.Ami = "ami-changed"
+				_, err = ecConfig.ensureLaunchTemplate(mock, ctx)
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(mock.CreateLaunchTemplateVersionInput).ShouldNot(BeNil())
+				Expect(*mock.CreateLaunchTemplateVersionInput.LaunchTemplateData.ImageId).Should(Equal("ami-changed"))
+			})
+
+			It("should fail when the version response carries no version number", func(ctx SpecContext) {
+				mock.DescribeLaunchTemplatesOutput = &ec2.DescribeLaunchTemplatesOutput{
+					LaunchTemplates: []types.LaunchTemplate{{LaunchTemplateName: aws.String("mpc-linux-amd64")}},
+				}
+				mock.CreateLaunchTemplateVersionOutput = &ec2.CreateLaunchTemplateVersionOutput{}
+
+				_, err := ecConfig.ensureLaunchTemplate(mock, ctx)
+
+				Expect(err).Should(MatchError(ContainSubstring("returned no version number")))
+				Expect(mock.ModifyLaunchTemplateInput).Should(BeNil())
+			})
+		})
+
+		When("the platform name is not configured", func() {
+			It("should return an error", func(ctx SpecContext) {
+				ecConfig.platformName = ""
+
+				_, err := ecConfig.ensureLaunchTemplate(mock, ctx)
+
+				Expect(err).Should(MatchError(ContainSubstring("platform name is required")))
+			})
+		})
+
+		When("an equivalent configuration is rebuilt with fresh pointers", func() {
+			It("should hash identically and not create a new version", func(ctx SpecContext) {
+				mock.DescribeLaunchTemplatesOutput = &ec2.DescribeLaunchTemplatesOutput{
+					LaunchTemplates: []types.LaunchTemplate{{LaunchTemplateName: aws.String("mpc-linux-amd64")}},
+				}
+				mock.CreateLaunchTemplateVersionOutput = &ec2.CreateLaunchTemplateVersionOutput{
+					LaunchTemplateVersion: &types.LaunchTemplateVersion{VersionNumber: aws.Int64(2)},
+				}
+
+				_, err := ecConfig.ensureLaunchTemplate(mock, ctx)
+				Expect(err).ShouldNot(HaveOccurred())
+				mock.CreateLaunchTemplateVersionInput = nil
+
+				rebuilt := newDefaultValidEC2ConfigForInstance()
+				rebuilt.platformName = "linux-amd64"
+				rebuilt.Iops = aws.Int32(*ecConfig.Iops)
+				rebuilt.Throughput = aws.Int32(*ecConfig.Throughput)
+				_, err = rebuilt.ensureLaunchTemplate(mock, ctx)
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(mock.CreateLaunchTemplateVersionInput).Should(BeNil())
+			})
+		})
+
+		When("describing the launch template fails", func() {
+			It("should return the error", func(ctx SpecContext) {
+				mock.DescribeLaunchTemplatesErr = errors.New("AccessDenied")
+
+				_, err := ecConfig.ensureLaunchTemplate(mock, ctx)
+
+				Expect(err).Should(MatchError(ContainSubstring("failed to describe launch template")))
+			})
+		})
+
+		When("creating the launch template fails", func() {
+			It("should return the error", func(ctx SpecContext) {
+				mock.DescribeLaunchTemplatesOutput = &ec2.DescribeLaunchTemplatesOutput{}
+				mock.CreateLaunchTemplateErr = errors.New("template quota exceeded")
+
+				_, err := ecConfig.ensureLaunchTemplate(mock, ctx)
+
+				Expect(err).Should(MatchError(ContainSubstring("failed to create launch template")))
+			})
+		})
+
+		When("creating a launch template version fails", func() {
+			It("should return the error", func(ctx SpecContext) {
+				mock.DescribeLaunchTemplatesOutput = &ec2.DescribeLaunchTemplatesOutput{
+					LaunchTemplates: []types.LaunchTemplate{{LaunchTemplateName: aws.String("mpc-linux-amd64")}},
+				}
+				mock.CreateLaunchTemplateVersionErr = errors.New("version rejected")
+
+				_, err := ecConfig.ensureLaunchTemplate(mock, ctx)
+
+				Expect(err).Should(MatchError(ContainSubstring("failed to create launch template version")))
+			})
+		})
+
+		When("setting the default version fails", func() {
+			It("should return the error", func(ctx SpecContext) {
+				mock.DescribeLaunchTemplatesOutput = &ec2.DescribeLaunchTemplatesOutput{
+					LaunchTemplates: []types.LaunchTemplate{{LaunchTemplateName: aws.String("mpc-linux-amd64")}},
+				}
+				mock.CreateLaunchTemplateVersionOutput = &ec2.CreateLaunchTemplateVersionOutput{
+					LaunchTemplateVersion: &types.LaunchTemplateVersion{VersionNumber: aws.Int64(8)},
+				}
+				mock.ModifyLaunchTemplateErr = errors.New("modify rejected")
+
+				_, err := ecConfig.ensureLaunchTemplate(mock, ctx)
+
+				Expect(err).Should(MatchError(ContainSubstring("failed to set default launch template version")))
+			})
+		})
+	})
+
+	Describe("launchTemplateData", func() {
+		It("should mirror the security group name when only a name is configured", func() {
+			ecConfig := newDefaultValidEC2ConfigForInstance()
+			ecConfig.SecurityGroupId = ""
+			ecConfig.SecurityGroup = "sg-name-example"
+
+			data := ecConfig.launchTemplateData()
+
+			Expect(data.SecurityGroups).Should(ConsistOf("sg-name-example"))
+			Expect(data.SecurityGroupIds).Should(BeNil())
+		})
+
+		It("should omit the IAM instance profile when none is configured", func() {
+			ecConfig := newDefaultValidEC2ConfigForInstance()
+			ecConfig.InstanceProfileArn = ""
+			ecConfig.InstanceProfileName = ""
+
+			data := ecConfig.launchTemplateData()
+
+			Expect(data.IamInstanceProfile).Should(BeNil())
+		})
+
+		It("should carry the instance profile name when only a name is configured", func() {
+			ecConfig := newDefaultValidEC2ConfigForInstance()
+			ecConfig.InstanceProfileArn = ""
+			ecConfig.InstanceProfileName = "profile-name-example"
+
+			data := ecConfig.launchTemplateData()
+
+			Expect(data.IamInstanceProfile).ShouldNot(BeNil())
+			Expect(*data.IamInstanceProfile.Name).Should(Equal("profile-name-example"))
+			Expect(data.IamInstanceProfile.Arn).Should(BeNil())
+		})
+	})
+
 	Describe("SecretCredentialsProvider Retrieve", func() {
 		var s *runtime.Scheme
 
@@ -404,4 +778,12 @@ func newDefaultValidEC2ConfigForInstance() AWSEc2DynamicConfig {
 		Throughput:         aws.Int32(125),
 		UserData:           defaultUserDataPtr,
 	}
+}
+
+// resetLaunchTemplateCache clears the in-process launch template version cache
+// between tests so each spec exercises the describe/create/version flow itself.
+func resetLaunchTemplateCache() {
+	launchTemplateCache.Lock()
+	launchTemplateCache.hashes = map[string]string{}
+	launchTemplateCache.Unlock()
 }

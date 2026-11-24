@@ -59,9 +59,16 @@ func CreateEc2CloudConfig(platformName string, config map[string]string, systemN
 		userDataPtr = &base64val
 	}
 
+	instanceTypes, instanceTypesErr := parseInstanceTypes(config["dynamic."+platformName+".instance-types"])
+	instanceType := config["dynamic."+platformName+".instance-type"]
+	if len(instanceTypes) > 0 {
+		instanceType = instanceTypes[0]
+	}
+
 	return AWSEc2DynamicConfig{Region: config["dynamic."+platformName+".region"],
 		Ami:                     config["dynamic."+platformName+".ami"],
-		InstanceType:            config["dynamic."+platformName+".instance-type"],
+		InstanceType:            instanceType,
+		InstanceTypes:           instanceTypes,
 		KeyName:                 config["dynamic."+platformName+".key-name"],
 		Secret:                  config["dynamic."+platformName+".aws-secret"],
 		SecurityGroup:           config["dynamic."+platformName+".security-group"],
@@ -79,6 +86,8 @@ func CreateEc2CloudConfig(platformName string, config map[string]string, systemN
 		HostResourceGroupArn:    config["dynamic."+platformName+".host-resource-group-arn"],
 		LicenseConfigurationArn: config["dynamic."+platformName+".license-configuration-arn"],
 		ProvisioningUser:        config["dynamic."+platformName+".provisioning-user"],
+		platformName:            platformName,
+		instanceTypesErr:        instanceTypesErr,
 	}
 }
 
@@ -95,10 +104,21 @@ func (ec AWSEc2DynamicConfig) LaunchInstance(kubeClient client.Client, ctx conte
 	log := logr.FromContextOrDiscard(ctx)
 	log.Info("Attempting to launch AWS EC2 instance", "taskRunName", taskRunName)
 
+	if ec.instanceTypesErr != nil {
+		return "", fmt.Errorf("invalid instance-types configuration for %s: %w", taskRunName, ec.instanceTypesErr)
+	}
+
 	// Use AWS credentials and configuration to create an EC2 client
 	ec2Client, err := ec.getEC2Client(kubeClient, ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to create an EC2 client: %w", err)
+	}
+
+	// A platform with several instance types launches through an EC2 Fleet
+	// request so the fallback types can absorb capacity errors; single-type
+	// platforms keep the RunInstances path.
+	if len(ec.InstanceTypes) > 1 {
+		return ec.launchFleet(ec2Client, ctx, taskRunName, instanceTag, additionalInstanceTags)
 	}
 
 	// Launch the new EC2 instance
@@ -150,8 +170,9 @@ func (ec AWSEc2DynamicConfig) CountInstances(kubeClient client.Client, ctx conte
 	count := 0
 	for _, reservation := range instancesOutput.Reservations {
 		for _, instance := range reservation.Instances {
-			// Verify the instance is running an is of the specified VM "flavor"
-			if instance.State.Name != types.InstanceStateNameTerminated && string(instance.InstanceType) == ec.InstanceType {
+			// Managed instances are scoped by tags; a platform may launch
+			// several instance types, so the type is not filtered here.
+			if instance.State.Name != types.InstanceStateNameTerminated {
 				log.Info("Counting instance towards running count", "instanceID", *instance.InstanceId)
 				count++
 			}
@@ -247,8 +268,9 @@ func (ec AWSEc2DynamicConfig) ListInstances(kubeClient client.Client, ctx contex
 	for _, reservation := range instancesOutput.Reservations {
 		for i := range reservation.Instances {
 			instance := reservation.Instances[i]
-			// Verify the instance is running an is of the specified VM "flavor"
-			if instance.State.Name != types.InstanceStateNameTerminated && string(instance.InstanceType) == ec.InstanceType {
+			// Managed instances are scoped by tags; a platform may launch
+			// several instance types, so the type is not filtered here.
+			if instance.State.Name != types.InstanceStateNameTerminated {
 				// Only list instance if it has an accessible IP
 				ip, err := ec.validateIPAddress(ctx, &instance)
 				if err == nil {
@@ -333,6 +355,12 @@ type AWSEc2DynamicConfig struct {
 	// for proper instance type naming conventions.
 	InstanceType string
 
+	// InstanceTypes holds the fallback list parsed from
+	// dynamic.<platform>.instance-types. When it names more than one type,
+	// LaunchInstance uses an EC2 Fleet request that tries them in list order;
+	// otherwise the single-type RunInstances path applies.
+	InstanceTypes []string
+
 	// KeyName is the name of the SSH key inside of AWS.
 	KeyName string
 
@@ -397,6 +425,14 @@ type AWSEc2DynamicConfig struct {
 	// pingFunc allows tests to inject a mock for SSH connectivity checks.
 	// When nil, the real pingIPAddress (TCP dial to port 22) is used.
 	pingFunc func(ip string) error
+
+	// platformName is the dashed platform label (e.g. "linux-amd64") the
+	// configuration was read from; it names the platform's launch template.
+	platformName string
+
+	// instanceTypesErr records a malformed dynamic.<platform>.instance-types
+	// value so LaunchInstance can reject it instead of ignoring the key.
+	instanceTypesErr error
 
 	// ProvisioningUser is the user used to provision the VM
 	ProvisioningUser string
